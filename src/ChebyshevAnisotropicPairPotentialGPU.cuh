@@ -107,22 +107,22 @@ gpu_compute_chebyshev_pair_forces(const chebyshev_pair_args_t& args);
 
 #ifdef __HIPCC__
 //! Evaluate Chebyshev polynomials of the first kind and their derivatives.
-__device__ inline void chebyshev_eval_device(Scalar x, unsigned int max_deg, Scalar* T, Scalar* dT)
+__device__ inline void chebyshev_eval_device(float x, unsigned int max_deg, float* T, float* dT)
     {
-    T[0] = Scalar(1);
-    dT[0] = Scalar(0);
+    T[0] = 1.0f;
+    dT[0] = 0.0f;
 
     if (max_deg == 0)
         return;
 
     T[1] = x;
-    dT[1] = Scalar(1);
+    dT[1] = 1.0f;
 
-    const Scalar two_x = Scalar(2) * x;
+    const float two_x = 2.0f * x;
     for (unsigned int n = 1; n < max_deg; ++n)
         {
         T[n + 1] = two_x * T[n] - T[n - 1];
-        dT[n + 1] = Scalar(2) * T[n] + two_x * dT[n] - dT[n - 1];
+        dT[n + 1] = 2.0f * T[n] + two_x * dT[n] - dT[n - 1];
         }
     }
 
@@ -130,6 +130,12 @@ __device__ inline void chebyshev_eval_device(Scalar x, unsigned int max_deg, Sca
 __device__ inline Scalar chebyshev_scale_device(Scalar x, Scalar lo, Scalar hi)
     {
     return (Scalar(2) * (x - lo) / (hi - lo)) - Scalar(1);
+    }
+
+//! Single-precision scaling for the univariate tables.
+__device__ inline float chebyshev_scale_device_f(float x, float lo, float hi)
+    {
+    return (2.0f * (x - lo) / (hi - lo)) - 1.0f;
     }
 
 template<class ShapeSymmetryT, unsigned int BLOCK_SIZE>
@@ -161,12 +167,12 @@ __global__ void gpu_compute_chebyshev_pair_forces_kernel(chebyshev_pair_args_t a
                                         args.domain_upper);
 
     // dynamic shared memory
-    // univariate T, univariate dT, & CUB reduce temp storage
+    // univariate T, univariate dT (single precision), & CUB reduce temp storage
     extern __shared__ unsigned char smem[];
     const unsigned int stride = chebyshev_max_degree + 1;
-    Scalar* s_T = reinterpret_cast<Scalar*>(smem);
-    Scalar* s_dT = s_T + n_coords * stride;
-    // CUB temp storage
+    float* s_T = reinterpret_cast<float*>(smem);
+    float* s_dT = s_T + n_coords * stride;
+    // CUB temp storage (double reduction)
     void* s_cub = reinterpret_cast<void*>(s_dT + n_coords * stride);
 
     // CUB block-reduce
@@ -322,49 +328,56 @@ __global__ void gpu_compute_chebyshev_pair_forces_kernel(chebyshev_pair_args_t a
         if (tid < n_coords)
             {
             const unsigned int c = tid;
-            Scalar x_scaled;
+            float x_scaled;
             if (c == 0)
-                x_scaled = chebyshev_scale_device(rho, Scalar(0), Scalar(1));
+                x_scaled = chebyshev_scale_device_f(float(rho), 0.0f, 1.0f);
             else
                 {
                 const Scalar ang[n_angles] = {theta, phi, alpha, beta, gamma};
-                x_scaled = chebyshev_scale_device(ang[c - 1],
-                                                  args.domain_lower[c - 1],
-                                                  args.domain_upper[c - 1]);
+                x_scaled = chebyshev_scale_device_f(float(ang[c - 1]),
+                                                    float(args.domain_lower[c - 1]),
+                                                    float(args.domain_upper[c - 1]));
                 }
             chebyshev_eval_device(x_scaled, max_deg[c], s_T + c * stride, s_dT + c * stride);
             }
         __syncthreads();
 
-        // each thread evaluates a chunk of the term list
-        Scalar u = Scalar(0);
-        Scalar du[n_coords] = {Scalar(0), Scalar(0), Scalar(0), Scalar(0), Scalar(0), Scalar(0)};
+        // Single-precision chain-rule scale factors.
+        float cheb_scale_f[n_coords];
+        for (unsigned int c = 0; c < n_coords; ++c)
+            cheb_scale_f[c] = float(cheb_scale[c]);
+
+        // each thread evaluates a chunk of the term list.
+        // Per-term work is single precision, but the running sums are accumulated in double so the
+        // forces/torques are conserved over the many terms.
+        double u = 0.0;
+        double du[n_coords] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
         for (unsigned int t = tid; t < args.Nterms; t += nthreads)
             {
             const unsigned int* degs = args.d_terms + n_coords * t;
-            const Scalar coeff = args.d_coeffs[t];
+            const float coeff = float(args.d_coeffs[t]);
 
-            Scalar T_vals[n_coords];
-            Scalar dT_vals[n_coords];
+            float T_vals[n_coords];
+            float dT_vals[n_coords];
             for (unsigned int c = 0; c < n_coords; ++c)
                 {
                 T_vals[c] = s_T[c * stride + degs[c]];
                 dT_vals[c] = s_dT[c * stride + degs[c]];
                 }
 
-            Scalar prefix[n_coords + 1];
-            prefix[0] = Scalar(1);
+            float prefix[n_coords + 1];
+            prefix[0] = 1.0f;
             for (unsigned int c = 0; c < n_coords; ++c)
                 prefix[c + 1] = prefix[c] * T_vals[c];
 
-            Scalar suffix[n_coords + 1];
-            suffix[n_coords] = Scalar(1);
+            float suffix[n_coords + 1];
+            suffix[n_coords] = 1.0f;
             for (int c = static_cast<int>(n_coords) - 1; c >= 0; --c)
                 suffix[c] = suffix[c + 1] * T_vals[c];
 
-            u += coeff * prefix[n_coords];
+            u += double(coeff * prefix[n_coords]);
             for (unsigned int c = 0; c < n_coords; ++c)
-                du[c] += coeff * dT_vals[c] * cheb_scale[c] * prefix[c] * suffix[c + 1];
+                du[c] += double(coeff * dT_vals[c] * cheb_scale_f[c] * prefix[c] * suffix[c + 1]);
             }
         __syncthreads();
 
@@ -466,7 +479,8 @@ inline void launch_chebyshev_kernel(const chebyshev_pair_args_t& args)
     {
     constexpr unsigned int n_coords = 6;
     const unsigned int stride = chebyshev_max_degree + 1;
-    const size_t univariate_bytes = static_cast<size_t>(2) * n_coords * stride * sizeof(Scalar);
+    // univariate tables are single precision
+    const size_t univariate_bytes = static_cast<size_t>(2) * n_coords * stride * sizeof(float);
 
     typedef hipcub::BlockReduce<Scalar, BLOCK_SIZE> BlockReduceT;
     const size_t cub_bytes = sizeof(typename BlockReduceT::TempStorage);
