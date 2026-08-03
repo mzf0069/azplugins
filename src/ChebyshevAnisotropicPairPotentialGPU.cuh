@@ -107,22 +107,23 @@ gpu_compute_chebyshev_pair_forces(const chebyshev_pair_args_t& args);
 
 #ifdef __HIPCC__
 //! Evaluate Chebyshev polynomials of the first kind and their derivatives.
-__device__ inline void chebyshev_eval_device(float x, unsigned int max_deg, float* T, float* dT)
+__device__ inline void
+chebyshev_eval_device(ShortReal x, unsigned int max_deg, ShortReal* T, ShortReal* dT)
     {
-    T[0] = 1.0f;
-    dT[0] = 0.0f;
+    T[0] = ShortReal(1.0);
+    dT[0] = ShortReal(0.0);
 
     if (max_deg == 0)
         return;
 
     T[1] = x;
-    dT[1] = 1.0f;
+    dT[1] = ShortReal(1.0);
 
-    const float two_x = 2.0f * x;
+    const ShortReal two_x = ShortReal(2.0) * x;
     for (unsigned int n = 1; n < max_deg; ++n)
         {
         T[n + 1] = two_x * T[n] - T[n - 1];
-        dT[n + 1] = 2.0f * T[n] + two_x * dT[n] - dT[n - 1];
+        dT[n + 1] = ShortReal(2.0) * T[n] + two_x * dT[n] - dT[n - 1];
         }
     }
 
@@ -133,9 +134,9 @@ __device__ inline Scalar chebyshev_scale_device(Scalar x, Scalar lo, Scalar hi)
     }
 
 //! Single-precision scaling for the univariate tables.
-__device__ inline float chebyshev_scale_device_f(float x, float lo, float hi)
+__device__ inline ShortReal chebyshev_scale_device_f(ShortReal x, ShortReal lo, ShortReal hi)
     {
-    return (2.0f * (x - lo) / (hi - lo)) - 1.0f;
+    return (ShortReal(2.0) * (x - lo) / (hi - lo)) - ShortReal(1.0);
     }
 
 template<class ShapeSymmetryT, unsigned int BLOCK_SIZE>
@@ -170,8 +171,8 @@ __global__ void gpu_compute_chebyshev_pair_forces_kernel(chebyshev_pair_args_t a
     // univariate T, univariate dT (single precision), & CUB reduce temp storage
     extern __shared__ unsigned char smem[];
     const unsigned int stride = chebyshev_max_degree + 1;
-    float* s_T = reinterpret_cast<float*>(smem);
-    float* s_dT = s_T + n_coords * stride;
+    ShortReal* s_T = reinterpret_cast<ShortReal*>(smem);
+    ShortReal* s_dT = s_T + n_coords * stride;
     // CUB temp storage (double reduction)
     void* s_cub = reinterpret_cast<void*>(s_dT + n_coords * stride);
 
@@ -328,56 +329,61 @@ __global__ void gpu_compute_chebyshev_pair_forces_kernel(chebyshev_pair_args_t a
         if (tid < n_coords)
             {
             const unsigned int c = tid;
-            float x_scaled;
+            ShortReal x_scaled;
             if (c == 0)
-                x_scaled = chebyshev_scale_device_f(float(rho), 0.0f, 1.0f);
+                x_scaled = chebyshev_scale_device_f(ShortReal(rho), ShortReal(0.0), ShortReal(1.0));
             else
                 {
                 const Scalar ang[n_angles] = {theta, phi, alpha, beta, gamma};
-                x_scaled = chebyshev_scale_device_f(float(ang[c - 1]),
-                                                    float(args.domain_lower[c - 1]),
-                                                    float(args.domain_upper[c - 1]));
+                x_scaled = chebyshev_scale_device_f(ShortReal(ang[c - 1]),
+                                                    ShortReal(args.domain_lower[c - 1]),
+                                                    ShortReal(args.domain_upper[c - 1]));
                 }
             chebyshev_eval_device(x_scaled, max_deg[c], s_T + c * stride, s_dT + c * stride);
             }
         __syncthreads();
 
         // Single-precision chain-rule scale factors.
-        float cheb_scale_f[n_coords];
+        ShortReal cheb_scale_f[n_coords];
         for (unsigned int c = 0; c < n_coords; ++c)
-            cheb_scale_f[c] = float(cheb_scale[c]);
+            cheb_scale_f[c] = ShortReal(cheb_scale[c]);
 
         // each thread evaluates a chunk of the term list.
         // Per-term work is single precision, but the running sums are accumulated in double so the
         // forces/torques are conserved over the many terms.
-        double u = 0.0;
-        double du[n_coords] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        LongReal u = LongReal(0.0);
+        LongReal du[n_coords] = {LongReal(0.0),
+                                 LongReal(0.0),
+                                 LongReal(0.0),
+                                 LongReal(0.0),
+                                 LongReal(0.0),
+                                 LongReal(0.0)};
         for (unsigned int t = tid; t < args.Nterms; t += nthreads)
             {
             const unsigned int* degs = args.d_terms + n_coords * t;
-            const float coeff = float(args.d_coeffs[t]);
+            const ShortReal coeff = ShortReal(args.d_coeffs[t]);
 
-            float T_vals[n_coords];
-            float dT_vals[n_coords];
+            ShortReal T_vals[n_coords];
+            ShortReal dT_vals[n_coords];
             for (unsigned int c = 0; c < n_coords; ++c)
                 {
                 T_vals[c] = s_T[c * stride + degs[c]];
                 dT_vals[c] = s_dT[c * stride + degs[c]];
                 }
 
-            float prefix[n_coords + 1];
-            prefix[0] = 1.0f;
+            ShortReal prefix[n_coords + 1];
+            prefix[0] = ShortReal(1.0);
             for (unsigned int c = 0; c < n_coords; ++c)
                 prefix[c + 1] = prefix[c] * T_vals[c];
 
-            float suffix[n_coords + 1];
-            suffix[n_coords] = 1.0f;
+            ShortReal suffix[n_coords + 1];
+            suffix[n_coords] = ShortReal(1.0);
             for (int c = static_cast<int>(n_coords) - 1; c >= 0; --c)
                 suffix[c] = suffix[c + 1] * T_vals[c];
 
-            u += double(coeff * prefix[n_coords]);
+            u += LongReal(coeff * prefix[n_coords]);
             for (unsigned int c = 0; c < n_coords; ++c)
-                du[c] += double(coeff * dT_vals[c] * cheb_scale_f[c] * prefix[c] * suffix[c + 1]);
+                du[c] += LongReal(coeff * dT_vals[c] * cheb_scale_f[c] * prefix[c] * suffix[c + 1]);
             }
         __syncthreads();
 
@@ -480,7 +486,7 @@ inline void launch_chebyshev_kernel(const chebyshev_pair_args_t& args)
     constexpr unsigned int n_coords = 6;
     const unsigned int stride = chebyshev_max_degree + 1;
     // univariate tables are single precision
-    const size_t univariate_bytes = static_cast<size_t>(2) * n_coords * stride * sizeof(float);
+    const size_t univariate_bytes = static_cast<size_t>(2) * n_coords * stride * sizeof(ShortReal);
 
     typedef hipcub::BlockReduce<Scalar, BLOCK_SIZE> BlockReduceT;
     const size_t cub_bytes = sizeof(typename BlockReduceT::TempStorage);
