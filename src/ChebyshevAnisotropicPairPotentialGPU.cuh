@@ -351,13 +351,8 @@ __global__ void gpu_compute_chebyshev_pair_forces_kernel(chebyshev_pair_args_t a
         // each thread evaluates a chunk of the term list.
         // Per-term work is single precision, but the running sums are accumulated in double so the
         // forces/torques are conserved over the many terms.
-        LongReal u = LongReal(0.0);
-        LongReal du[n_coords] = {LongReal(0.0),
-                                 LongReal(0.0),
-                                 LongReal(0.0),
-                                 LongReal(0.0),
-                                 LongReal(0.0),
-                                 LongReal(0.0)};
+        LongReal u = 0.0;
+        LongReal du[n_coords] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
         for (unsigned int t = tid; t < args.Nterms; t += nthreads)
             {
             const unsigned int* degs = args.d_terms + n_coords * t;
@@ -381,9 +376,13 @@ __global__ void gpu_compute_chebyshev_pair_forces_kernel(chebyshev_pair_args_t a
             for (int c = static_cast<int>(n_coords) - 1; c >= 0; --c)
                 suffix[c] = suffix[c + 1] * T_vals[c];
 
-            u += LongReal(coeff * prefix[n_coords]);
+            u += coeff * prefix[n_coords];
             for (unsigned int c = 0; c < n_coords; ++c)
-                du[c] += LongReal(coeff * dT_vals[c] * cheb_scale_f[c] * prefix[c] * suffix[c + 1]);
+                {
+                ShortReal basis_function_deriv
+                    = dT_vals[c] * cheb_scale_f[c] * prefix[c] * suffix[c + 1];
+                du[c] += coeff * basis_function_deriv;
+                }
             }
         __syncthreads();
 
